@@ -1,17 +1,3 @@
-#!/usr/bin/env python3
-"""
-EE267 – Part 3: Traffic Manager
-Spawns background traffic (vehicles + pedestrians) under CARLA's Traffic Manager.
-
-Key features:
-- Synchronous world + synchronous TM (robust across CARLA builds)
-- Optional world clear (--clear)
-- Robust spawning with detailed error messages and retries
-- Safe cleanup (stop controllers, destroy actors, restore world settings)
-
-Tested with CARLA 0.9.15
-"""
-
 import argparse
 import atexit
 import random
@@ -21,8 +7,6 @@ from typing import List
 
 import carla
 
-
-# ----------------------------- Utilities -----------------------------
 
 def trace(*a):
     print("[TRACE]", *a)
