@@ -1,7 +1,3 @@
-#!/usr/bin/env python3
-# Part 3 – Traffic Manager: spawn background traffic and save a screenshot
-# Works with CARLA 0.9.15
-
 import argparse
 import atexit
 import random
