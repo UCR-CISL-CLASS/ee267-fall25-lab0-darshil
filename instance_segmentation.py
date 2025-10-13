@@ -15,7 +15,7 @@ TARGET_NPCS = 40                                        # Step 2: how many vehic
 FIXED_DT = 0.05
 POSE_JSON = "instance_camera_pose.json"
 OPTIONAL_SAVE_PNG = "instance_segmentation.png"         # Saved only if you press 's'
-
+TITLE = "(Instance Seg) — Press n: next step | s: save PNG | q: quit"
 
 def put_instructions(bgr, step):
     h, w = bgr.shape[:2]
