@@ -3,65 +3,23 @@ import random
 import queue
 import numpy as np
 import cv2
-import json
 from pathlib import Path
 
-# ---------- Config (edit if needed) ----------
-CAM_LOC = carla.Location(x=0.0, y=0.0, z=2.2)          # Step 1: camera location
-CAM_ROT = carla.Rotation(pitch=0.0, yaw=0.0, roll=0.0) # Step 1: camera rotation
+# ---------- Config ----------
+CAM_LOC = carla.Location(x=0.0, y=0.0, z=2.2)
+CAM_ROT = carla.Rotation(pitch=0.0, yaw=0.0, roll=0.0)
 IMG_W, IMG_H, FOV = 1280, 720, 90
-SPAWN_RADIUS_M = 80.0                                   # Step 2: radius
-TARGET_NPCS = 40                                        # Step 2: how many vehicles to try
+SPAWN_RADIUS_M = 80.0
+TARGET_NPCS = 40
 FIXED_DT = 0.05
-POSE_JSON = "instance_camera_pose.json"
-OPTIONAL_SAVE_PNG = "instance_segmentation.png"         # Saved only if you press 's'
-TITLE = "(Instance Seg) — Press n: next step | s: save PNG | q: quit"
-
-def put_instructions(bgr, step):
-    h, w = bgr.shape[:2]
-    lines = [
-        f"STEP {step}/5",
-        "n = next step   s = save PNG (Raw IDs)   q = quit",
-    ]
-    if step == 1:
-        lines += [
-            "Step 1: Camera spawned (instance segmentation).",
-            "Transform saved to instance_camera_pose.json.",
-            "Take your screenshot now if needed, then press 'n'.",
-        ]
-    elif step == 2:
-        lines += [
-            f"Step 2: Spawning vehicles within {SPAWN_RADIUS_M:.0f} m of camera.",
-            "Wait for cars to appear; take your screenshot; press 'n' to continue.",
-        ]
-    elif step == 3:
-        lines += [
-            "Step 3: Live instance-seg feed running (IDs as colors).",
-            "You can take screenshots anytime; press 'n' to set spectator for overview.",
-        ]
-    elif step == 4:
-        lines += [
-            "Step 4: Spectator positioned overhead (good for overview screenshots).",
-            "Fly around in your viewer if open; take screenshot; press 'n' to finish.",
-        ]
-    elif step == 5:
-        lines += [
-            "Step 5: Finished. Press 'q' to quit (cleanup & restore).",
-        ]
-    y = 28
-    cv2.putText(bgr, TITLE, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30, 230, 30), 2, cv2.LINE_AA)
-    y += 30
-    for ln in lines:
-        cv2.putText(bgr, ln, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
-        y += 24
-    return bgr
+INSTANCE_PNG = "instance_segmentation.png"  # saved automatically once, or press 'i' to re-save
 
 def main():
     client = carla.Client("localhost", 2000)
     client.set_timeout(20.0)
     world = client.get_world()
 
-    # Enable synchronous mode
+    # --- Synchronous mode ---
     original = world.get_settings()
     s = world.get_settings()
     s.synchronous_mode = True
@@ -69,107 +27,111 @@ def main():
     world.apply_settings(s)
 
     spawned = []
-    q = queue.Queue()
-    step = 1
-    did_step2_spawns = False
+    rgb_q = queue.Queue()
+    inst_q = queue.Queue()
+    instance_saved = False
 
     try:
         bp_lib = world.get_blueprint_library()
 
-        # STEP 1: Create blueprint, choose pose, spawn camera, save transform
-        cam_bp = bp_lib.find("sensor.camera.instance_segmentation")
-        cam_bp.set_attribute("image_size_x", str(IMG_W))
-        cam_bp.set_attribute("image_size_y", str(IMG_H))
-        cam_bp.set_attribute("fov", str(FOV))
+        # ---------- Sensors (same pose): RGB + Instance ----------
+        # RGB
+        rgb_bp = bp_lib.find("sensor.camera.rgb")
+        rgb_bp.set_attribute("image_size_x", str(IMG_W))
+        rgb_bp.set_attribute("image_size_y", str(IMG_H))
+        rgb_bp.set_attribute("fov", str(FOV))
         cam_tf = carla.Transform(CAM_LOC, CAM_ROT)
-        camera = world.spawn_actor(cam_bp, cam_tf)
-        spawned.append(camera)
-        camera.listen(q.put)
+        rgb_cam = world.spawn_actor(rgb_bp, cam_tf)
+        spawned.append(rgb_cam)
+        rgb_cam.listen(rgb_q.put)
 
-        # Save camera transform for your report
-        Path(".").mkdir(parents=True, exist_ok=True)
-        with open(POSE_JSON, "w") as f:
-            json.dump(
-                {
-                    "location": {"x": CAM_LOC.x, "y": CAM_LOC.y, "z": CAM_LOC.z},
-                    "rotation": {"pitch": CAM_ROT.pitch, "yaw": CAM_ROT.yaw, "roll": CAM_ROT.roll},
-                    "image_size": {"width": IMG_W, "height": IMG_H, "fov": FOV},
-                },
-                f, indent=2
-            )
-        print(f"[Step 1] Camera spawned. Pose saved -> {POSE_JSON}")
+        # Instance segmentation
+        inst_bp = bp_lib.find("sensor.camera.instance_segmentation")
+        inst_bp.set_attribute("image_size_x", str(IMG_W))
+        inst_bp.set_attribute("image_size_y", str(IMG_H))
+        inst_bp.set_attribute("fov", str(FOV))
+        inst_cam = world.spawn_actor(inst_bp, cam_tf)
+        spawned.append(inst_cam)
+        inst_cam.listen(inst_q.put)
 
-        # Prepare vehicles blueprints & spawn points ahead of Step 2
+        # ---------- Populate scene: spawn NPCs within 80 m ----------
         vehicle_bps = bp_lib.filter("vehicle.*")
         spawns = world.get_map().get_spawn_points()
         random.shuffle(spawns)
 
-        # OpenCV window
-        cv2.namedWindow("InstanceSeg (IDs as colors)", cv2.WINDOW_AUTOSIZE)
+        count = 0
+        for sp in spawns:
+            if count >= TARGET_NPCS:
+                break
+            if sp.location.distance(CAM_LOC) <= SPAWN_RADIUS_M:
+                bp = random.choice(vehicle_bps)
+                if bp.has_attribute("color"):
+                    bp.set_attribute("color", random.choice(bp.get_attribute("color").recommended_values))
+                npc = world.try_spawn_actor(bp, sp)
+                if npc:
+                    npc.set_autopilot(True)
+                    spawned.append(npc)
+                    count += 1
+        print(f"[Info] Spawned {count} vehicles within {SPAWN_RADIUS_M} m of the camera.")
 
-        # Warm-up sensor
-        world.tick(); _ = q.get(True, 5)
+        # Optional: set spectator overhead to help you frame screenshots in a viewer
+        spectator = world.get_spectator()
+        spectator.set_transform(
+            carla.Transform(
+                carla.Location(x=CAM_LOC.x, y=CAM_LOC.y, z=120.0),
+                carla.Rotation(pitch=-90.0)
+            )
+        )
 
-        # Loop until user presses q. Use 'n' to advance steps.
+        # Warm up both sensors
+        world.tick(); _ = rgb_q.get(True, 5)
+        world.tick(); _ = inst_q.get(True, 5)
+
+        # Live RGB window (normal world view)
+        cv2.namedWindow("RGB View (Press i: save instance PNG, q: quit)", cv2.WINDOW_AUTOSIZE)
+        print("RGB live view running. Take your screenshots manually from this window.")
+        print("Press 'i' to save an instance-seg image, 'q' to quit.")
+
+        # Automatically save one instance frame once things are populated
+        def save_instance_frame():
+            nonlocal instance_saved
+            # advance one tick to ensure a fresh instance frame
+            world.tick()
+            inst_img = inst_q.get(True, 5)
+            inst_img.save_to_disk(INSTANCE_PNG, carla.ColorConverter.Raw)
+            instance_saved = True
+            print(f"[Info] Saved instance segmentation PNG -> {INSTANCE_PNG}")
+
+        # Save once automatically after a couple extra ticks
+        world.tick(); _ = inst_q.get(True, 5)
+        save_instance_frame()
+
         while True:
             world.tick()
-            image = q.get(True, 5)
+            rgb_img = rgb_q.get(True, 5)
 
-            # Instance segmentation frames are BGRA bytes (RGB encodes instance IDs)
-            frame = np.frombuffer(image.raw_data, dtype=np.uint8).reshape((image.height, image.width, 4))
-            bgr = frame[:, :, :3]  # drop alpha for display
+            # Convert BGRA to BGR for display
+            frame = np.frombuffer(rgb_img.raw_data, dtype=np.uint8).reshape((rgb_img.height, rgb_img.width, 4))
+            bgr = frame[:, :, :3]
 
-            # On Step 2 trigger: spawn vehicles within 80 m (only once)
-            if step >= 2 and not did_step2_spawns:
-                count = 0
-                for sp in spawns:
-                    if count >= TARGET_NPCS:
-                        break
-                    if sp.location.distance(CAM_LOC) <= SPAWN_RADIUS_M:
-                        bp = random.choice(vehicle_bps)
-                        if bp.has_attribute("color"):
-                            bp.set_attribute("color", random.choice(bp.get_attribute("color").recommended_values))
-                        npc = world.try_spawn_actor(bp, sp)
-                        if npc:
-                            npc.set_autopilot(True)
-                            spawned.append(npc)
-                            count += 1
-                did_step2_spawns = True
-                print(f"[Step 2] Spawned {count} vehicles within {SPAWN_RADIUS_M} m of camera.")
+            # UI hint
+            cv2.putText(bgr, "RGB view | 'i': save instance PNG | 'q': quit",
+                        (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (40, 240, 40), 2, cv2.LINE_AA)
 
-            # On Step 4 trigger: place spectator for an overview
-            if step >= 4:
-                spectator = world.get_spectator()
-                spectator.set_transform(
-                    carla.Transform(
-                        carla.Location(x=CAM_LOC.x, y=CAM_LOC.y, z=120.0),
-                        carla.Rotation(pitch=-90.0)
-                    )
-                )
+            if instance_saved:
+                cv2.putText(bgr, f"Saved: {INSTANCE_PNG}", (10, 52),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 2, cv2.LINE_AA)
 
-            # Overlay instructions
-            bgr = put_instructions(bgr, min(step, 5))
-
-            # Show live
-            cv2.imshow("InstanceSeg (IDs as colors)", bgr)
+            cv2.imshow("RGB View (Press i: save instance PNG, q: quit)", bgr)
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
-                # Step 5: finish/cleanup
-                print("[Step 5] Quit requested.")
                 break
-            elif key == ord('n'):
-                # Advance to next step
-                if step < 5:
-                    step += 1
-                    print(f"[Info] Moved to Step {step}.")
-            elif key == ord('s'):
-                # Optional: save one PNG of the raw IDs
-                image.save_to_disk(OPTIONAL_SAVE_PNG, carla.ColorConverter.Raw)
-                print(f"[Info] Saved {OPTIONAL_SAVE_PNG}")
+            if key == ord('i'):
+                save_instance_frame()
 
     finally:
         cv2.destroyAllWindows()
-        # cleanup & restore
+        # Restore settings and cleanup
         try:
             world.apply_settings(original)
         except Exception:
