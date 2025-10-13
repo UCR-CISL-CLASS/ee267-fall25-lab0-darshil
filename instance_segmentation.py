@@ -4,22 +4,23 @@ import queue
 import numpy as np
 import cv2
 from pathlib import Path
+import json
 
-# ---------- Config ----------
-CAM_LOC = carla.Location(x=0.0, y=0.0, z=2.2)
-CAM_ROT = carla.Rotation(pitch=0.0, yaw=0.0, roll=0.0)
+# -------- Edit these if you want different camera pose / size --------
+CAM_LOC = carla.Location(x=0.0, y=0.0, z=2.2)           # camera location in world
+CAM_ROT = carla.Rotation(pitch=0.0, yaw=0.0, roll=0.0)  # camera rotation
 IMG_W, IMG_H, FOV = 1280, 720, 90
 SPAWN_RADIUS_M = 80.0
 TARGET_NPCS = 40
 FIXED_DT = 0.05
-INSTANCE_PNG = "instance_segmentation.png"  # saved automatically once, or press 'i' to re-save
+POSE_JSON = "instance_camera_pose.json"
 
 def main():
     client = carla.Client("localhost", 2000)
     client.set_timeout(20.0)
     world = client.get_world()
 
-    # --- Synchronous mode ---
+    # --- Synchronous mode for stable frames ---
     original = world.get_settings()
     s = world.get_settings()
     s.synchronous_mode = True
@@ -27,34 +28,34 @@ def main():
     world.apply_settings(s)
 
     spawned = []
-    rgb_q = queue.Queue()
-    inst_q = queue.Queue()
-    instance_saved = False
-
     try:
         bp_lib = world.get_blueprint_library()
 
-        # ---------- Sensors (same pose): RGB + Instance ----------
-        # RGB
-        rgb_bp = bp_lib.find("sensor.camera.rgb")
-        rgb_bp.set_attribute("image_size_x", str(IMG_W))
-        rgb_bp.set_attribute("image_size_y", str(IMG_H))
-        rgb_bp.set_attribute("fov", str(FOV))
+        # 1) Set up the instance segmentation camera
+        cam_bp = bp_lib.find("sensor.camera.instance_segmentation")
+        cam_bp.set_attribute("image_size_x", str(IMG_W))
+        cam_bp.set_attribute("image_size_y", str(IMG_H))
+        cam_bp.set_attribute("fov", str(FOV))
+
         cam_tf = carla.Transform(CAM_LOC, CAM_ROT)
-        rgb_cam = world.spawn_actor(rgb_bp, cam_tf)
-        spawned.append(rgb_cam)
-        rgb_cam.listen(rgb_q.put)
+        camera = world.spawn_actor(cam_bp, cam_tf)
+        spawned.append(camera)
 
-        # Instance segmentation
-        inst_bp = bp_lib.find("sensor.camera.instance_segmentation")
-        inst_bp.set_attribute("image_size_x", str(IMG_W))
-        inst_bp.set_attribute("image_size_y", str(IMG_H))
-        inst_bp.set_attribute("fov", str(FOV))
-        inst_cam = world.spawn_actor(inst_bp, cam_tf)
-        spawned.append(inst_cam)
-        inst_cam.listen(inst_q.put)
+        # Save camera transform for your report
+        Path(".").mkdir(parents=True, exist_ok=True)
+        with open(POSE_JSON, "w") as f:
+            json.dump(
+                {
+                    "location": {"x": CAM_LOC.x, "y": CAM_LOC.y, "z": CAM_LOC.z},
+                    "rotation": {"pitch": CAM_ROT.pitch, "yaw": CAM_ROT.yaw, "roll": CAM_ROT.roll},
+                    "image_size": {"width": IMG_W, "height": IMG_H, "fov": FOV},
+                },
+                f,
+                indent=2,
+            )
+        print(f"[Info] Saved camera transform -> {POSE_JSON}")
 
-        # ---------- Populate scene: spawn NPCs within 80 m ----------
+        # 2) Populate the scene: spawn vehicles within 80 m of camera
         vehicle_bps = bp_lib.filter("vehicle.*")
         spawns = world.get_map().get_spawn_points()
         random.shuffle(spawns)
@@ -74,7 +75,7 @@ def main():
                     count += 1
         print(f"[Info] Spawned {count} vehicles within {SPAWN_RADIUS_M} m of the camera.")
 
-        # Optional: set spectator overhead to help you frame screenshots in a viewer
+        # Optional: position spectator above the camera for easy manual screenshots
         spectator = world.get_spectator()
         spectator.set_transform(
             carla.Transform(
@@ -83,51 +84,29 @@ def main():
             )
         )
 
-        # Warm up both sensors
-        world.tick(); _ = rgb_q.get(True, 5)
-        world.tick(); _ = inst_q.get(True, 5)
+        q = queue.Queue()
+        camera.listen(q.put)
 
-        # Live RGB window (normal world view)
-        cv2.namedWindow("RGB View (Press i: save instance PNG, q: quit)", cv2.WINDOW_AUTOSIZE)
-        print("RGB live view running. Take your screenshots manually from this window.")
-        print("Press 'i' to save an instance-seg image, 'q' to quit.")
+        # Warm-up
+        world.tick(); _ = q.get(True, 5)
 
-        # Automatically save one instance frame once things are populated
-        def save_instance_frame():
-            nonlocal instance_saved
-            # advance one tick to ensure a fresh instance frame
-            world.tick()
-            inst_img = inst_q.get(True, 5)
-            inst_img.save_to_disk(INSTANCE_PNG, carla.ColorConverter.Raw)
-            instance_saved = True
-            print(f"[Info] Saved instance segmentation PNG -> {INSTANCE_PNG}")
-
-        # Save once automatically after a couple extra ticks
-        world.tick(); _ = inst_q.get(True, 5)
-        save_instance_frame()
+        cv2.namedWindow("InstanceSeg (IDs as colors)", cv2.WINDOW_AUTOSIZE)
+        print("Live instance segmentation running.")
+        print("Take screenshots manually (OS/VNC tools). Press 'q' to quit.")
 
         while True:
             world.tick()
-            rgb_img = rgb_q.get(True, 5)
+            image = q.get(True, 5)
 
-            # Convert BGRA to BGR for display
-            frame = np.frombuffer(rgb_img.raw_data, dtype=np.uint8).reshape((rgb_img.height, rgb_img.width, 4))
-            bgr = frame[:, :, :3]
+            # Instance seg frames are BGRA bytes with per-instance IDs encoded as RGB
+            frame = np.frombuffer(image.raw_data, dtype=np.uint8)
+            frame = frame.reshape((image.height, image.width, 4))  # BGRA
+            bgr = frame[:, :, :3]  # drop alpha for display
 
-            # UI hint
-            cv2.putText(bgr, "RGB view | 'i': save instance PNG | 'q': quit",
-                        (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (40, 240, 40), 2, cv2.LINE_AA)
-
-            if instance_saved:
-                cv2.putText(bgr, f"Saved: {INSTANCE_PNG}", (10, 52),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 2, cv2.LINE_AA)
-
-            cv2.imshow("RGB View (Press i: save instance PNG, q: quit)", bgr)
+            cv2.imshow("InstanceSeg (IDs as colors)", bgr)
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
-            if key == ord('i'):
-                save_instance_frame()
 
     finally:
         cv2.destroyAllWindows()
@@ -146,7 +125,6 @@ def main():
             client.apply_batch([carla.command.DestroyActor(a) for a in spawned if a and a.is_alive])
         except Exception:
             pass
-        print("[Info] Cleaned up and restored settings.")
 
 if __name__ == "__main__":
     main()
